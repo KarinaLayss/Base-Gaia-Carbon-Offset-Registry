@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.23;
+
+contract GaiaCarbonOffsetRegistry {
+    struct EcoProject {
+        address payable developer;
+        uint256 pricePerTonWei;
+        uint256 availableTons;
+        uint256 totalRetiredTons;
+        bool isActive;
+        bytes32 standardCode;
+    }
+
+    address payable public immutable registryAuditor;
+    string public registryName;
+    uint256 public projectCounter;
+    uint256 public auditGrantPool;
+    uint256 public collectedProceeds;
+    bool public isRegistryPaused;
+
+    mapping(bytes32 => bool) public approvedStandards;
+    mapping(uint256 => EcoProject) public projects;
+    mapping(uint256 => mapping(address => uint256)) public holderCredits;
+    mapping(uint256 => mapping(address => uint256)) public holderPaidETH;
+    mapping(address => uint256) public lifetimeRetiredCO2;
+
+    event StandardApproved(bytes32 indexed standardCode);
+    event CreditsPurchased(uint256 indexed projectId, address indexed buyer, uint256 tons, uint256 costWei);
+    event ProjectDeactivated(uint256 indexed projectId);
+    event AuditGrantDeposited(address indexed donor, uint256 amount);
+    event RegistryReservesDrained(address indexed auditor, uint256 amount);
+    event ProceedsHarvested(address indexed auditor, uint256 amount);
+    event EcoProjectRegistered(uint256 indexed projectId, address indexed developer, uint256 pricePerTonWei, uint256 initialTons);
+    event UnusedCreditsRefunded(uint256 indexed projectId, address indexed holder, uint256 tons, uint256 refundedWei);
+    event CarbonTonRepriced(uint256 indexed projectId, uint256 newPriceWei);
+    event CarbonFootprintRetired(uint256 indexed projectId, address indexed entity, uint256 retiredTons);
+    event RegistryPauseToggled(bool isPaused);
+    event RegistryNameUpdated(string newName);
+
+    modifier onlyAuditor() {
+        require(msg.sender == registryAuditor, "GaiaRegistry: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isRegistryPaused, "GaiaRegistry: Registry paused");
+        _;
+    }
+
+    constructor() {
+        registryAuditor = payable(msg.sender);
+        registryName = "Gaia Base Carbon Credit & ESG Offset Registry v1";
+        isRegistryPaused = false;
+        approvedStandards[0x56455252415f5643535f5354414e444152440000000000000000000000000000] = true;
+    }
+
+    // 1. approveEcoStandard
+    function approveEcoStandard(bytes32 standardCode) external onlyAuditor {
+        require(!approvedStandards[standardCode], "GaiaRegistry: Already approved");
+        approvedStandards[standardCode] = true;
+        emit StandardApproved(standardCode);
+    }
+
+    // 2. buyCarbonCredits
+    function buyCarbonCredits(uint256 projectId, uint256 tonsToBuy) external payable whenNotPaused {
+        EcoProject storage p = projects[projectId];
+        require(projectId > 0 && projectId <= projectCounter, "GaiaRegistry: Invalid project ID");
+        require(p.isActive, "GaiaRegistry: Project inactive");
+        require(tonsToBuy > 0 && p.availableTons >= tonsToBuy, "GaiaRegistry: Insufficient credits");
+
+        uint256 requiredETH = tonsToBuy * p.pricePerTonWei;
+        require(msg.value >= requiredETH, "GaiaRegistry: Insufficient ETH sent");
+
+        p.availableTons -= tonsToBuy;
+        holderCredits[projectId][msg.sender] += tonsToBuy;
+        holderPaidETH[projectId][msg.sender] += msg.value;
+        collectedProceeds += msg.value;
+
+        emit CreditsPurchased(projectId, msg.sender, tonsToBuy, msg.value);
+    }
+
+    // 3. deactivateEcoProject
+    function deactivateEcoProject(uint256 projectId) external {
+        EcoProject storage p = projects[projectId];
+        require(projectId > 0 && projectId <= projectCounter, "GaiaRegistry: Invalid project ID");
+        require(msg.sender == p.developer || msg.sender == registryAuditor, "GaiaRegistry: Unauthorized");
+        require(p.isActive, "GaiaRegistry: Already inactive");
+
+        p.isActive = false;
+        emit ProjectDeactivated(projectId);
+    }
+
+    // 4. depositAuditGrantPool
+    function depositAuditGrantPool() external payable onlyAuditor {
+        require(msg.value > 0, "GaiaRegistry: Zero grant");
+        auditGrantPool += msg.value;
+        emit AuditGrantDeposited(msg.sender, msg.value);
+    }
+
+    // 5. drainRegistryReserves
+    function drainRegistryReserves() external onlyAuditor {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "GaiaRegistry: Zero balance");
+
+        auditGrantPool = 0;
+        collectedProceeds = 0;
+
+        (bool sent, ) = registryAuditor.call{value: balance}("");
+        require(sent, "GaiaRegistry: Drain failed");
+
+        emit RegistryReservesDrained(registryAuditor, balance);
+    }
+
+    // 6. harvestProjectProceeds
+    function harvestProjectProceeds() external onlyAuditor {
+        uint256 payout = collectedProceeds + auditGrantPool;
+        if (payout > address(this).balance) {
+            payout = address(this).balance;
+        }
+        require(payout > 0, "GaiaRegistry: Zero proceeds");
+
+        collectedProceeds = 0;
+        auditGrantPool = 0;
+
+        (bool sent, ) = registryAuditor.call{value: payout}("");
+        require(sent, "GaiaRegistry: Harvest failed");
+
+        emit ProceedsHarvested(registryAuditor, payout);
+    }
+
+    // 7. registerEcoProject
+    function registerEcoProject(
+        uint256 pricePerTonWei,
+        uint256 initialTonsSupply,
+        bytes32 standardCode
+    ) external whenNotPaused returns (uint256) {
+        require(approvedStandards[standardCode], "GaiaRegistry: Unapproved standard");
+        require(pricePerTonWei > 0 && initialTonsSupply > 0, "GaiaRegistry: Invalid parameters");
+
+        projectCounter++;
+        projects[projectCounter] = EcoProject({
+            developer: payable(msg.sender),
+            pricePerTonWei: pricePerTonWei,
+            availableTons: initialTonsSupply,
+            totalRetiredTons: 0,
+            isActive: true,
+            standardCode: standardCode
+        });
+
+        emit EcoProjectRegistered(projectCounter, msg.sender, pricePerTonWei, initialTonsSupply);
+        return projectCounter;
+    }
+
+    // 8. refundUnusedCredits
+    function refundUnusedCredits(uint256 projectId, uint256 tonsToRefund) external {
+        EcoProject storage p = projects[projectId];
+        require(projectId > 0 && projectId <= projectCounter, "GaiaRegistry: Invalid project ID");
+        uint256 held = holderCredits[projectId][msg.sender];
+        require(held >= tonsToRefund && tonsToRefund > 0, "GaiaRegistry: Insufficient credits");
+
+        uint256 paid = holderPaidETH[projectId][msg.sender];
+        uint256 refundWei = (paid * tonsToRefund) / held;
+
+        holderCredits[projectId][msg.sender] -= tonsToRefund;
+        holderPaidETH[projectId][msg.sender] -= refundWei;
+        p.availableTons += tonsToRefund;
+
+        if (collectedProceeds >= refundWei) {
+            collectedProceeds -= refundWei;
+        } else {
+            collectedProceeds = 0;
+        }
+
+        if (refundWei > 0 && address(this).balance >= refundWei) {
+            (bool sent, ) = payable(msg.sender).call{value: refundWei}("");
+            require(sent, "GaiaRegistry: Refund transfer failed");
+        }
+
+        emit UnusedCreditsRefunded(projectId, msg.sender, tonsToRefund, refundWei);
+    }
+
+    // 9. repriceCarbonTon
+    function repriceCarbonTon(uint256 projectId, uint256 newPriceWei) external {
+        EcoProject storage p = projects[projectId];
+        require(projectId > 0 && projectId <= projectCounter, "GaiaRegistry: Invalid project ID");
+        require(msg.sender == p.developer || msg.sender == registryAuditor, "GaiaRegistry: Unauthorized");
+        require(newPriceWei > 0, "GaiaRegistry: Zero price");
+
+        p.pricePerTonWei = newPriceWei;
+        emit CarbonTonRepriced(projectId, newPriceWei);
+    }
+
+    // 10. retireCarbonFootprint
+    function retireCarbonFootprint(uint256 projectId, uint256 tonsToRetire) external whenNotPaused {
+        EcoProject storage p = projects[projectId];
+        require(projectId > 0 && projectId <= projectCounter, "GaiaRegistry: Invalid project ID");
+        require(holderCredits[projectId][msg.sender] >= tonsToRetire && tonsToRetire > 0, "GaiaRegistry: Not enough credits");
+
+        holderCredits[projectId][msg.sender] -= tonsToRetire;
+        p.totalRetiredTons += tonsToRetire;
+        lifetimeRetiredCO2[msg.sender] += tonsToRetire;
+
+        emit CarbonFootprintRetired(projectId, msg.sender, tonsToRetire);
+    }
+
+    // 11. toggleRegistryPause
+    function toggleRegistryPause(bool isPaused) external onlyAuditor {
+        isRegistryPaused = isPaused;
+        emit RegistryPauseToggled(isPaused);
+    }
+
+    // 12. updateRegistryName
+    function updateRegistryName(string calldata newName) external onlyAuditor {
+        require(bytes(newName).length > 0, "GaiaRegistry: Empty name");
+        registryName = newName;
+        emit RegistryNameUpdated(newName);
+    }
+
+    // Read-метод
+    function getProjectDetails(uint256 projectId) external view returns (
+        address developer,
+        uint256 pricePerTonWei,
+        uint256 availableTons,
+        uint256 totalRetiredTons,
+        bool isActive,
+        bytes32 standardCode
+    ) {
+        EcoProject memory p = projects[projectId];
+        return (p.developer, p.pricePerTonWei, p.availableTons, p.totalRetiredTons, p.isActive, p.standardCode);
+    }
+}
